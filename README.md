@@ -1,2 +1,2 @@
-# low-cost-frequency-delay
-# Low Cost Frequency Delay (LCFD) implemented on a FPGA.
+# low-cost-frequency-relay
+# Low Cost Frequency Relay (LCFR) implemented on an Altera DE2-115 FPGA. Used FreeRTOS for real time operating system.
