@@ -4,7 +4,6 @@
 #include <string.h>
 #include <math.h>
 
-
 /* Scheduler includes. */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -29,8 +28,6 @@ void relay_control_callback(TimerHandle_t xTimer);
 void switchPollInit();
 void maintanenceInit();
 
-
-
 // global variables
 unsigned int uiSwitchValue = 0;
 unsigned int uiButtonValue = 0;
@@ -48,7 +45,8 @@ SemaphoreHandle_t maintenance_sem;
 SemaphoreHandle_t relay_manage_sem;
 
 int find_right_most_bit(int n) {
-	if (n == 0) return 0;
+	if (n == 0)
+		return 0;
 	return n & -n;
 }
 
@@ -160,36 +158,47 @@ static void RelayLoadManagementTask(void *pvParameters) {
 				xTimerReset(relay_timer, 10);
 			} else {
 				if (relay_volatility_state == 1) {
-					// if volatile -> remove a relay
-					printf("still volatile removing right most on relay: %d\n", relay_value_mask);
-					int load = find_right_most_bit(relay_value_mask);
+					// if volatile -> remove left most on load
+//					blocked_relay_mask = (blocked_relay_mask & relay_value_mask);
+//					int load = find_right_most_bit(blocked_relay_mask);
+//					printf("removing relay: %d\n", load);
+//					blocked_relay_mask = blocked_relay_mask ^ load;
 
-					if (load != 0) {
-						printf("removing relay: %d\n", index);
-						relay_value_mask = (relay_value_mask ^ load);
-						blocked_relay_mask = blocked_relay_mask ^ load;
-					} else {
-						printf("All relays are already off.\n");
+					int load = 0;
+					int pos = 0;
+					int i;
+					for (i = 0; i < NUM_OF_RELAYS; i++) {
+						// if anding the blocked mask with the only bit is 1 (then active).
+						pos = (int) pow(2, i);
+						if ((blocked_relay_mask & pos) == pos) {
+							if ((relay_value_mask & pos) == pos) {
+								load = pos;
+								break;
+							}
+						}
 					}
 
-					printf("resting timer as state is still bad.\n");
+					printf("removing relay: %d\n", load);
+					blocked_relay_mask^=load;
+
 					xTimerReset(relay_timer, 10);
 				} else {
 					// not volatile so add relay
-					printf("%d", blocked_relay_mask);
 					if (blocked_relay_mask != 31) {
-						int relay = find_right_most_bit(blocked_relay_mask);
-						printf("Turning on relay: %d ", relay);
+						int relay = 0;
 
-						if (relay == 0) {
-							// if no right bit => set 5th index to on. (xor with 1)
-							relay_value_mask = relay_value_mask ^ 1;
-							blocked_relay_mask = blocked_relay_mask ^ 1;
-						} else {
-							// set index - 1 on. (or)
-							blocked_relay_mask = blocked_relay_mask | relay;
-							relay_value_mask = relay_value_mask | relay;
+						// find first unset bit from 5
+						int i;
+						for (i = 4; i >= 0; i--) {
+							// if anding the blocked mask with the only bit is 0 => found
+							if ((blocked_relay_mask & (int) pow(2, i)) == 0) {
+								relay = (int) pow(2, i);
+								break;
+							}
 						}
+
+						printf("Turning on relay: %d ", relay);
+						blocked_relay_mask = blocked_relay_mask | relay;
 
 						printf("reseting timer as not all relays are switched back on.\n");
 						xTimerReset(relay_timer, 10);
@@ -199,9 +208,9 @@ static void RelayLoadManagementTask(void *pvParameters) {
 				blocked_relay_mask = blocked_relay_mask & RELAY_MASK;
 
 				// set LEDS
-				printf("blocked relay number: %d ", blocked_relay_mask);
-				printf("relay value: %d ", relay_value_mask);
-				printf("relay actual: %d\n", relay_value_mask & blocked_relay_mask);
+				printf("%d ", blocked_relay_mask);
+				printf(" : %d : ", relay_value_mask);
+				printf("%d\n", relay_value_mask & blocked_relay_mask);
 				IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE,
 						relay_value_mask & blocked_relay_mask);
 			}
@@ -210,35 +219,35 @@ static void RelayLoadManagementTask(void *pvParameters) {
 }
 
 static void ToggleMaintenanceTask(void *pvParameters) {
-	while (1) {
-		if (xSemaphoreTake(maintenance_sem, ( TickType_t ) 10 )) {
-			printf("Maintenance Task \n");
+while (1) {
+	if (xSemaphoreTake(maintenance_sem, ( TickType_t ) 10 )) {
+		printf("Maintenance Task \n");
 
-			int* temp = (int*) pvParameters;
-			IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, *temp);
-		}
+		int* temp = (int*) pvParameters;
+		IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, *temp);
 	}
+}
 }
 
 static void SwitchPollingTask(void *pvParameters) {
-	while (1) {
-		unsigned int* temp = (unsigned int*) pvParameters;
+while (1) {
+	unsigned int* temp = (unsigned int*) pvParameters;
 
-		// read the value of the switch and store to uiSwitchValue
-		*temp = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
+	// read the value of the switch and store to uiSwitchValue
+	*temp = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
 
-		if (relay_volatility_state == 0) {
-			// write the value of the switches to the red LEDs
+	if (relay_volatility_state == 0) {
+		// write the value of the switches to the red LEDs
 //			printf("reading switches");
-			IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, *temp & RELAY_MASK);
+		IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, *temp & RELAY_MASK);
 
-			relay_value_mask = *temp;
-		} else {
-			// write the value of the switches to the red LEDs
+		relay_value_mask = *temp;
+	} else {
+		// write the value of the switches to the red LEDs
 //			IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, *temp & blocked_relay_mask);
-		}
-
-		// delay for 100ms
-		vTaskDelay(1000);
 	}
+
+	// delay for 100ms
+	vTaskDelay(1000);
+}
 }
