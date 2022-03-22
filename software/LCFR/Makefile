@@ -142,7 +142,6 @@ ACDS_VERSION := 13.0
 ELF := LCFR.elf
 
 # Paths to C, C++, and assembly source files.
-C_SRCS += ./freertos_semaphore.c
 C_SRCS += ./FreeRTOS/croutine.c
 C_SRCS += ./FreeRTOS/event_groups.c
 C_SRCS += ./FreeRTOS/heap.c
@@ -151,6 +150,7 @@ C_SRCS += ./FreeRTOS/port.c
 C_SRCS += ./FreeRTOS/queue.c
 C_SRCS += ./FreeRTOS/tasks.c
 C_SRCS += ./FreeRTOS/timers.c
+C_SRCS += C:/Windows/main.c
 CXX_SRCS :=
 ASM_SRCS := ./FreeRTOS/port_asm.S
 
