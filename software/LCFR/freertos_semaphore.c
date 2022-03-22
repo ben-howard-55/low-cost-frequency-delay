@@ -4,6 +4,7 @@
 #include <string.h>
 #include <math.h>
 
+
 /* Scheduler includes. */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -14,9 +15,9 @@
 #include "altera_avalon_pio_regs.h" 	// to use PIO functions
 #include "sys/alt_irq.h"              	// to register interrupts
 // task priorities
-#define MAINTENANCE_TASK_PRIORITY 5
-#define SWITCH_POLLING_TASK_PRIORITY 6
-#define RELAY_MANAGER_TASK_PRIORITY 4
+#define MAINTENANCE_TASK_PRIORITY 3
+#define SWITCH_POLLING_TASK_PRIORITY 3
+#define RELAY_MANAGER_TASK_PRIORITY 8
 
 // function definitions
 static void ToggleMaintenanceTask(void *pvParameters);
@@ -27,6 +28,8 @@ void relay_control_callback(TimerHandle_t xTimer);
 
 void switchPollInit();
 void maintanenceInit();
+
+
 
 // global variables
 unsigned int uiSwitchValue = 0;
@@ -46,7 +49,7 @@ SemaphoreHandle_t relay_manage_sem;
 
 int find_right_most_bit(int n) {
 	if (n == 0) return 0;
-	return log2(n & -n) + 1;
+	return n & -n;
 }
 
 void button_interrupts_function(void* context, alt_u32 id) {
@@ -159,42 +162,38 @@ static void RelayLoadManagementTask(void *pvParameters) {
 				if (relay_volatility_state == 1) {
 					// if volatile -> remove a relay
 					printf("still volatile removing right most on relay: %d\n", relay_value_mask);
-					int index = 0;
-					if (relay_value_mask != 0) {
-						index = find_right_most_bit(relay_value_mask);
-					}
+					int load = find_right_most_bit(relay_value_mask);
 
-					if (index != 0) {
+					if (load != 0) {
 						printf("removing relay: %d\n", index);
-						relay_value_mask = (relay_value_mask ^ (int) pow(2, index));
-						blocked_relay_mask = relay_value_mask;
+						relay_value_mask = (relay_value_mask ^ load);
+						blocked_relay_mask = blocked_relay_mask ^ load;
 					} else {
 						printf("All relays are already off.\n");
 					}
 
 					printf("resting timer as state is still bad.\n");
 					xTimerReset(relay_timer, 10);
-
 				} else {
 					// not volatile so add relay
-					int relay = find_right_most_bit(blocked_relay_mask);
-
-					printf("Turning on relay: %d ", relay);
+					printf("%d", blocked_relay_mask);
 					if (blocked_relay_mask != 31) {
+						int relay = find_right_most_bit(blocked_relay_mask);
+						printf("Turning on relay: %d ", relay);
+
 						if (relay == 0) {
-							int rm = (int) pow(2, NUM_OF_RELAYS-1);
-							// if no right bit => set 5th index to on. (xor)
-							relay_value_mask = relay_value_mask ^ rm;
-							blocked_relay_mask = blocked_relay_mask ^ rm;
+							// if no right bit => set 5th index to on. (xor with 1)
+							relay_value_mask = relay_value_mask ^ 1;
+							blocked_relay_mask = blocked_relay_mask ^ 1;
 						} else {
-							int rm = (int) pow(2, relay-1);
 							// set index - 1 on. (or)
-							blocked_relay_mask = blocked_relay_mask | rm;
-							relay_value_mask = relay_value_mask | rm;
+							blocked_relay_mask = blocked_relay_mask | relay;
+							relay_value_mask = relay_value_mask | relay;
 						}
+
+						printf("reseting timer as not all relays are switched back on.\n");
+						xTimerReset(relay_timer, 10);
 					}
-					printf("reseting timer as not all relays are switched back on.\n");
-					xTimerReset(relay_timer, 10);
 				}
 				relay_value_mask = relay_value_mask & RELAY_MASK;
 				blocked_relay_mask = blocked_relay_mask & RELAY_MASK;
