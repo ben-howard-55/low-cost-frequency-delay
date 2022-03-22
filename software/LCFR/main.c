@@ -12,38 +12,58 @@
 #include "freertos/semphr.h"
 #include "freertos/timers.h"
 
+/* DE2-115 includes. */
 #include "altera_avalon_pio_regs.h" 	// to use PIO functions
 #include "sys/alt_irq.h"              	// to register interrupts
-// task priorities
-#define MAINTENANCE_TASK_PRIORITY 3
-#define SWITCH_POLLING_TASK_PRIORITY 3
-#define LOAD_MANAGER_TASK_PRIORITY 8
 
-// global constants
-const int LOAD_MASK = 31; // limits load to 5 switches
-const int NUM_OF_LOADS = 5;
+/**
+ * CONSTANT VARIABLES
+ */
+#define LOAD_MASK 		31
+#define NUM_OF_LOADS 	5
 
-// function definitions
+// Task priorities
+#define MAINTENANCE_TASK_PRIORITY		 3
+#define SWITCH_POLLING_TASK_PRIORITY	 3
+#define LOAD_MANAGER_TASK_PRIORITY 		 8
+
+
+/**
+ * Function Definitions
+ */
+
+// Task definitions
 static void ToggleMaintenanceTask(void *pvParameters);
 static void LoadManagementTask(void *pvParameters);
 static void SwitchPollingTask(void *pvParameters);
 
-void load_control_callback(TimerHandle_t xTimer);
+// Interrupt Service Routine definitions
+void MaintenanceButtonInterrupt(void* context, alt_u32 id);
+//void FrequencyAnalyzerInterrupt(void* context, alt_u32 id);
 
+// Timer call-backs definitions
+void LoadControlTimerCallback(TimerHandle_t xTimer);
+
+// Initialisation functions definitions
 void switchPollInit();
 void maintanenceInit();
+
+/**
+ * Global Variables
+ */
 
 // input global variables
 unsigned int uiSwitchValue = 0;
 unsigned int uiButtonValue = 0;
 
-// system state global variables.
+// System state global variables.
 bool load_volatility_state = false;
 bool maintenance_state = false;
 bool load_control_state = false;
 
+// load management masks
 int load_value = 0;
-int blocked_load_mask = 31; // 31 -> block no LOADS
+int blocked_load_mask = 31; // 31 -> block no LOADS (11111xb)
 
 // global timer
 TimerHandle_t load_timer;
@@ -52,68 +72,26 @@ TimerHandle_t load_timer;
 SemaphoreHandle_t maintenance_sem;
 SemaphoreHandle_t load_manage_sem;
 
-int find_right_most_bit(int n) {
-	if (n == 0)
-		return 0;
-	return n & -n;
-}
-
-void button_interrupts_function(void* context, alt_u32 id) {
-	// need to cast the context first before using it
-	int* temp = (int*) context;
-	(*temp) = IORD_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE);
-
-	// clears the edge capture register
-	IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
-
-	if (*temp == 1) {
-		printf("maintenance button pressed \n");
-		xSemaphoreGiveFromISR(maintenance_sem, pdFALSE);
-	} else if (*temp == 2) {
-		printf("volatility button pressed \n");
-		load_volatility_state = true;
-		load_control_state = true;
-
-		xSemaphoreGiveFromISR(load_manage_sem, pdFALSE);
-	} else if (*temp == 4) {
-		printf("un-volatility button pressed \n");
-		load_volatility_state = false;
-
-		xSemaphoreGiveFromISR(load_manage_sem, pdFALSE);
-	}
-}
-
-void FrequencyAnalyzerInterrupt(void* context, alt_u32 id) {
-	int* temp = (int*) context;
-
-	// determine whether passed value is bad
-	if (*temp == 1) {
-		// check if timer active
-		if (xTimerIsTimerActive(load_timer) != pdFALSE) {
-			// If active reset timer
-			BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-
-			xTimerResetFromISR(load_timer, &xHigherPriorityTaskWoken);
-		} else {
-			// call load_control task
-			xSemaphoreGiveFromISR(load_manage_sem, pdFALSE);
-		}
-	}
-}
+/**
+ * Functions
+ */
 
 int main(void) {
-	// set up semaphores
+	// Set up semaphores
 	maintenance_sem = xSemaphoreCreateBinary();
 	load_manage_sem = xSemaphoreCreateBinary();
 
+	// Set up timer
+	int timer_id = 1;
+	load_timer = xTimerCreate("load Timer", pdMS_TO_TICKS(5000), pdFALSE, &timer_id, LoadControlTimerCallback);
+
 	switchPollInit();
 	maintanenceInit();
-	int timer_id = 1;
 
-	// set up timer
-	load_timer = xTimerCreate("load Timer", pdMS_TO_TICKS(5000), pdFALSE, &timer_id, load_control_callback);
+	// Register the ISRs
+	alt_irq_register(PUSH_BUTTON_IRQ, (void*) &uiButtonValue, MaintenanceButtonInterrupt);
 
-	// Tasks
+	// Create Tasks
 	xTaskCreate( ToggleMaintenanceTask, "Maintenance Task", configMINIMAL_STACK_SIZE, &uiButtonValue, MAINTENANCE_TASK_PRIORITY, NULL);
 	xTaskCreate( SwitchPollingTask, "Switch Polling Task",configMINIMAL_STACK_SIZE, &uiSwitchValue, SWITCH_POLLING_TASK_PRIORITY, NULL);
 	xTaskCreate( LoadManagementTask, "load Manager Task", configMINIMAL_STACK_SIZE, NULL, LOAD_MANAGER_TASK_PRIORITY, NULL);
@@ -127,9 +105,52 @@ int main(void) {
 		;
 }
 
-// timer call back
-void load_control_callback(TimerHandle_t xTimer) {
-	printf("load_control:: timer call back...\n");
+void MaintenanceButtonInterrupt(void* context, alt_u32 id) {
+	// need to cast the context first before using it
+	int* temp = (int*) context;
+	(*temp) = IORD_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE);
+
+	// clears the edge capture register
+	IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
+
+	// This logic is in place of actual relay for now.
+	if (*temp == 1) {
+		xSemaphoreGiveFromISR(maintenance_sem, pdFALSE);
+	} else if (*temp == 2) {
+		printf("Relay is volatile \n");
+		load_volatility_state = true;
+		load_control_state = true;
+
+		xSemaphoreGiveFromISR(load_manage_sem, pdFALSE);
+	} else if (*temp == 4) {
+		printf("Relay is not volatile: \n");
+		load_volatility_state = false;
+
+		xSemaphoreGiveFromISR(load_manage_sem, pdFALSE);
+	}
+}
+
+// currently not used
+//void FrequencyAnalyzerInterrupt(void* context, alt_u32 id) {
+//	int* temp = (int*) context;
+//
+//	// determine whether passed value is bad
+//	if (*temp == 1) {
+//		// check if timer active
+//		if (xTimerIsTimerActive(load_timer) != pdFALSE) {
+//			// If active reset timer
+//			BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+//
+//			xTimerResetFromISR(load_timer, &xHigherPriorityTaskWoken);
+//		} else {
+//			// call load_control task
+//			xSemaphoreGiveFromISR(load_manage_sem, pdFALSE);
+//		}
+//	}
+//}
+
+void LoadControlTimerCallback(TimerHandle_t xTimer) {
+	printf("timer call back...\n");
 	xSemaphoreGiveFromISR(load_manage_sem, pdFALSE);
 }
 
@@ -140,8 +161,7 @@ void maintanenceInit() {
 	// enable interrupts for first two buttons (for now)
 	IOWR_ALTERA_AVALON_PIO_IRQ_MASK(PUSH_BUTTON_BASE, 0x7);
 
-	// register the ISR
-	alt_irq_register(PUSH_BUTTON_IRQ, (void*) &uiButtonValue, button_interrupts_function);
+
 }
 
 void switchPollInit() {
@@ -164,8 +184,8 @@ static void LoadManagementTask(void *pvParameters) {
 					printf("no volatility and no load control!\n");
 
 				} else {
-					// TODO: Check if a switch has been turned off that was previously on
-					// and update logic to ignore on shedding and un-shedding.
+					/* TODO: Check if a switch has been turned off that was previously on
+					   and update logic to ignore on shedding and un-shedding. */
 
 
 					// if input is volatile
@@ -174,8 +194,8 @@ static void LoadManagementTask(void *pvParameters) {
 						int pos = 0;
 						int i;
 
-						// find least significant bit in which both the blocked_load_mask and load_value are equal
-						// This is the least important load to shed.
+						/* Find least significant bit in which both the blocked_load_mask and load_value are equal.
+						   This is the least important load to shed. */
 						for (i = 0; i < NUM_OF_LOADS; i++) {
 							// if anding the blocked mask with the only bit is the bit (then active).
 							pos = (int) pow(2, i);
@@ -209,7 +229,7 @@ static void LoadManagementTask(void *pvParameters) {
 							//TODO: turn off green LED
 
 							printf("Turning on load: %d ", load);
-							blocked_load_mask = blocked_load_mask | load;
+							blocked_load_mask |= load;
 
 							printf("reseting timer as not all LOADS are switched back on.\n");
 							xTimerReset(load_timer, 10);
@@ -218,13 +238,13 @@ static void LoadManagementTask(void *pvParameters) {
 							printf("Exiting load balancing state!\n");
 						}
 					}
-					load_value = load_value & LOAD_MASK;
-					blocked_load_mask = blocked_load_mask & LOAD_MASK;
 
-					// set LEDS
-					printf("%d ", blocked_load_mask);
-					printf(" : %d : ", load_value);
-					printf("%d\n", load_value & blocked_load_mask);
+					// ensure loads are limited within mask
+					load_value &= LOAD_MASK;
+					blocked_load_mask &= LOAD_MASK;
+
+					// set red LEDS (load)
+					printf("%d : %d : %d", blocked_load_mask,load_value,load_value & blocked_load_mask);
 					IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, load_value & blocked_load_mask);
 				}
 			}
@@ -258,8 +278,8 @@ static void SwitchPollingTask(void *pvParameters) {
 
 			load_value = *temp;
 		} else {
-			// TODO: only able to turn off loads
-			// immediately turn off load and some how update load manager about said task
+			/* TODO: only able to turn off loads
+			   immediately turn off load and some how update load manager about said task */
 		}
 
 		// delay for 100ms
