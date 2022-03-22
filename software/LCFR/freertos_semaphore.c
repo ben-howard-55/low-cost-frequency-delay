@@ -13,116 +13,131 @@
 
 #include "altera_avalon_pio_regs.h" 	// to use PIO functions
 #include "sys/alt_irq.h"              	// to register interrupts
-
 // task priorities
 #define MAINTENANCE_TASK_PRIORITY 5
 #define SWITCH_POLLING_TASK_PRIORITY 6
+#define RELAY_MANAGER_TASK_PRIORITY 4
 
 // function definitions
 static void ToggleMaintenanceTask(void *pvParameters);
+static void RelayLoadManagementTask(void *pvParameters);
 static void SwitchPollingTask(void *pvParameters);
-void relay_control(TimerHandle_t xTimer);
+
+void relay_control_callback(TimerHandle_t xTimer);
+
 void switchPollInit();
 void maintanenceInit();
 
 // global variables
 unsigned int uiSwitchValue = 0;
-int buttonValue = 0;
-int relay_state = 31;
+unsigned int uiButtonValue = 0;
+int relay_value_mask = 0;
+int relay_volatility_state = 0;
 int NUM_OF_RELAYS = 5;
-int num_of_blocked_relays = 0;
+int blocked_relay_mask = 31; // 31 -> block no relays
 int RELAY_MASK = 31; // limits relay to 5 switches
 
+// global timer
+TimerHandle_t relay_timer;
 
 // semaphores
 SemaphoreHandle_t maintenance_sem;
+SemaphoreHandle_t relay_manage_sem;
 
 int find_right_most_bit(int n) {
-    return log2(n & -n) + 1;
+	if (n == 0) return 0;
+	return log2(n & -n) + 1;
 }
 
-
-void button_interrupts_function(void* context, alt_u32 id)
-{
+void button_interrupts_function(void* context, alt_u32 id) {
 	// need to cast the context first before using it
 	int* temp = (int*) context;
 	(*temp) = IORD_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE);
 
 	// clears the edge capture register
-	IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, *temp);
+	IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
 
-	printf("maintenance button pressed \n");
+	if (*temp == 1) {
+		printf("maintenance button pressed \n");
+		xSemaphoreGiveFromISR(maintenance_sem, pdFALSE);
+	} else if (*temp == 2) {
+		printf("volatility button pressed \n");
+		relay_volatility_state = 1;
 
-	xSemaphoreGiveFromISR(maintenance_sem, pdFALSE);
-}
+		xSemaphoreGiveFromISR(relay_manage_sem, pdFALSE);
+	} else if (*temp == 4) {
+		printf("un-volatility button pressed \n");
+		relay_volatility_state = 0;
 
-void voltage_reading_isr(void* context, alt_u32 id) {
-	int reading = 50;
-	if (reading < 48 || reading >= 52) {
-
+		xSemaphoreGiveFromISR(relay_manage_sem, pdFALSE);
 	}
 }
 
+void FrequencyAnalyzerInterrupt(void* context, alt_u32 id) {
+	int* temp = (int*) context;
 
+	// determine whether passed value is bad
+	if (*temp == 1) {
+		// check if timer active
+		if (xTimerIsTimerActive(relay_timer) != pdFALSE) {
+			// If active reset timer
+			BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
+			xTimerResetFromISR(relay_timer, &xHigherPriorityTaskWoken);
+		} else {
+			// call relay_control task
+			xSemaphoreGiveFromISR(relay_manage_sem, pdFALSE);
+		}
+	}
+}
 
-
-
-
-int main(void)
-{
-	// set up
+int main(void) {
+	// set up sems
 	maintenance_sem = xSemaphoreCreateBinary();
+	relay_manage_sem = xSemaphoreCreateBinary();
 
 	switchPollInit();
 	maintanenceInit();
 
 	// set up timer
-	TimerHandle_t relay_timer = xTimerCreate("Relay Timer" , pdMS_TO_TICKS(500), pdFALSE, 1, relay_control);
-	xTimerStart(relay_timer, 10);
+	relay_timer = xTimerCreate("Relay Timer", pdMS_TO_TICKS(5000), pdFALSE, 1,
+			relay_control_callback);
 
 	// Tasks
-	xTaskCreate( ToggleMaintenanceTask, "Maintenance Task", configMINIMAL_STACK_SIZE, &buttonValue, MAINTENANCE_TASK_PRIORITY, NULL);
-	xTaskCreate( SwitchPollingTask, "Switch Polling Task", configMINIMAL_STACK_SIZE, &uiSwitchValue, SWITCH_POLLING_TASK_PRIORITY, NULL);
+	xTaskCreate( ToggleMaintenanceTask, "Maintenance Task",
+			configMINIMAL_STACK_SIZE, &uiButtonValue, MAINTENANCE_TASK_PRIORITY,
+			NULL);
+	xTaskCreate( SwitchPollingTask, "Switch Polling Task",
+			configMINIMAL_STACK_SIZE, &uiSwitchValue,
+			SWITCH_POLLING_TASK_PRIORITY, NULL);
+	xTaskCreate( RelayLoadManagementTask, "Relay Manager Task",
+			configMINIMAL_STACK_SIZE, NULL, RELAY_MANAGER_TASK_PRIORITY, NULL);
 
 	/* Finally start the scheduler. */
 	vTaskStartScheduler();
 
 	/* Will only reach here if there is insufficient heap available to start
-	the scheduler. */
-	for (;;);
+	 the scheduler. */
+	for (;;)
+		;
 }
 
-void relay_control(TimerHandle_t xTimer) {
+// timer callback
+void relay_control_callback(TimerHandle_t xTimer) {
 	printf("relay_control:: timer callback...\n");
-
-	// if not stable
-	if (relay_state == 1) {
-		// call task for turning off relays
-		printf("turning off next relay : %d\n", find_right_most_bit(relay_state));
-	} else {
-		// call task for turning back on relays
-		printf("turning on next relay: %d\n", find_right_most_bit(relay_state) - 1);
-	}
-
-	// if all relays are not back on reset timer.
-	if (num_of_blocked_relays > 0) {
-		printf("resting timer as relays are not all unblocked.\n");
-		xTimerReset(xTimer, 10);
-	} else {
-		printf("all relays are back online!\n");
-	}
+	xSemaphoreGiveFromISR(relay_manage_sem, pdFALSE);
 }
 
 void maintanenceInit() {
 	// clears the edge capture register. Writing 1 to bit clears pending interrupt for corresponding button.
 	IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
 	IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, 0x0);
-	// enable interrupts for first button
-	IOWR_ALTERA_AVALON_PIO_IRQ_MASK(PUSH_BUTTON_BASE, 0x1);
+	// enable interrupts for first two buttons (for now)
+	IOWR_ALTERA_AVALON_PIO_IRQ_MASK(PUSH_BUTTON_BASE, 0x7);
 
 	// register the ISR
-	alt_irq_register(PUSH_BUTTON_IRQ,(void*)&buttonValue, button_interrupts_function);
+	alt_irq_register(PUSH_BUTTON_IRQ, (void*) &uiButtonValue,
+			button_interrupts_function);
 }
 
 void switchPollInit() {
@@ -131,10 +146,72 @@ void switchPollInit() {
 	IOWR_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE, 0x0);
 }
 
+static void RelayLoadManagementTask(void *pvParameters) {
+	while (1) {
+		// wait for semaphore release
+		if (xSemaphoreTake(relay_manage_sem, ( TickType_t ) 10 )) {
+			// if timer active reset
+			if (xTimerIsTimerActive(relay_timer) != pdFALSE) {
+				printf("reseting timer as still active\n");
+				BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+				xTimerReset(relay_timer, 10);
+			} else {
+				if (relay_volatility_state == 1) {
+					// if volatile -> remove a relay
+					printf("still volatile removing right most on relay: %d\n", relay_value_mask);
+					int index = 0;
+					if (relay_value_mask != 0) {
+						index = find_right_most_bit(relay_value_mask);
+					}
+
+					if (index != 0) {
+						printf("removing relay: %d\n", index);
+						relay_value_mask = (relay_value_mask ^ (int) pow(2, index));
+						blocked_relay_mask = relay_value_mask;
+					} else {
+						printf("All relays are already off.\n");
+					}
+
+					printf("resting timer as state is still bad.\n");
+					xTimerReset(relay_timer, 10);
+
+				} else {
+					// not volatile so add relay
+					int relay = find_right_most_bit(blocked_relay_mask);
+
+					printf("Turning on relay: %d ", relay);
+					if (blocked_relay_mask != 31) {
+						if (relay == 0) {
+							int rm = (int) pow(2, NUM_OF_RELAYS-1);
+							// if no right bit => set 5th index to on. (xor)
+							relay_value_mask = relay_value_mask ^ rm;
+							blocked_relay_mask = blocked_relay_mask ^ rm;
+						} else {
+							int rm = (int) pow(2, relay-1);
+							// set index - 1 on. (or)
+							blocked_relay_mask = blocked_relay_mask | rm;
+							relay_value_mask = relay_value_mask | rm;
+						}
+					}
+					printf("reseting timer as not all relays are switched back on.\n");
+					xTimerReset(relay_timer, 10);
+				}
+				relay_value_mask = relay_value_mask & RELAY_MASK;
+				blocked_relay_mask = blocked_relay_mask & RELAY_MASK;
+
+				// set LEDS
+				printf("blocked relay number: %d ", blocked_relay_mask);
+				printf("relay value: %d ", relay_value_mask);
+				printf("relay actual: %d\n", relay_value_mask & blocked_relay_mask);
+				IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE,
+						relay_value_mask & blocked_relay_mask);
+			}
+		}
+	}
+}
 
 static void ToggleMaintenanceTask(void *pvParameters) {
-	while (1)
-	{
+	while (1) {
 		if (xSemaphoreTake(maintenance_sem, ( TickType_t ) 10 )) {
 			printf("Maintenance Task \n");
 
@@ -145,20 +222,24 @@ static void ToggleMaintenanceTask(void *pvParameters) {
 }
 
 static void SwitchPollingTask(void *pvParameters) {
-	while (1)
-	{
-		printf("polling switches");
+	while (1) {
 		unsigned int* temp = (unsigned int*) pvParameters;
 
-	    // read the value of the switch and store to uiSwitchValue
-	    *temp = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
-	    // write the value of the switches to the red LEDs
-	    IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, *temp & RELAY_MASK);
-	    printf("%u", *temp & RELAY_MASK);
-	    printf("%u", *temp);
-	    printf("%u", RELAY_MASK);
+		// read the value of the switch and store to uiSwitchValue
+		*temp = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
 
-	    // delay for 100ms
+		if (relay_volatility_state == 0) {
+			// write the value of the switches to the red LEDs
+//			printf("reading switches");
+			IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, *temp & RELAY_MASK);
+
+			relay_value_mask = *temp;
+		} else {
+			// write the value of the switches to the red LEDs
+//			IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, *temp & blocked_relay_mask);
+		}
+
+		// delay for 100ms
 		vTaskDelay(1000);
 	}
 }
