@@ -84,7 +84,7 @@ task.h is included from an application file. */
 #include "FreeRTOSConfig.h"
 
 #undef MPU_WRAPPERS_INCLUDED_FROM_API_FILE
-#define size_t long unsigned int
+//#define size_t long unsigned int
 /* Block sizes must not get too small. */
 #define heapMINIMUM_BLOCK_SIZE  ( ( size_t ) ( heapSTRUCT_SIZE * 2 ) )
 

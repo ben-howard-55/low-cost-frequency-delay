@@ -13,9 +13,8 @@
 #include "freertos/timers.h"
 
 /* DE2-115 includes. */
-#include "altera_avalon_pio_regs.h" 	// to use PIO functions
-#include "sys/alt_irq.h"              	// to register interrupts
-
+#include "altera_avalon_pio_regs.h"	// to use PIO functions
+#include "sys\alt_irq.h"  	// to register interrupts
 /**
  * CONSTANT VARIABLES
  */
@@ -24,9 +23,8 @@
 
 // Task priorities
 #define MAINTENANCE_TASK_PRIORITY		3
-#define SWITCH_POLLING_TASK_PRIORITY	3
+#define SWITCH_POLLING_TASK_PRIORITY	1
 #define LOAD_MANAGER_TASK_PRIORITY		8
-
 
 /**
  * Function Definitions
@@ -64,6 +62,12 @@ bool load_control_state = false;
 // load management masks
 int load_value = 0;
 int blocked_load_mask = 31; // 31 -> block no LOADS (11111xb)
+int blocked_loads = 0;
+
+// frequency global variables
+int rate_of_change_frequency = 0;
+int current_frequency;
+int frequency_history[5];
 
 // global timer
 TimerHandle_t load_timer;
@@ -83,7 +87,7 @@ int main(void) {
 
 	// Set up timer
 	int timer_id = 1;
-	load_timer = xTimerCreate("load Timer", pdMS_TO_TICKS(5000), pdFALSE, &timer_id, LoadControlTimerCallback);
+	load_timer = xTimerCreate("load Timer", pdMS_TO_TICKS(500), pdFALSE, &timer_id, LoadControlTimerCallback);
 
 	switchPollInit();
 	maintanenceInit();
@@ -96,6 +100,7 @@ int main(void) {
 	xTaskCreate( SwitchPollingTask, "Switch Polling Task",configMINIMAL_STACK_SIZE, &uiSwitchValue, SWITCH_POLLING_TASK_PRIORITY, NULL);
 	xTaskCreate( LoadManagementTask, "load Manager Task", configMINIMAL_STACK_SIZE, NULL, LOAD_MANAGER_TASK_PRIORITY, NULL);
 
+
 	/* Finally start the scheduler. */
 	vTaskStartScheduler();
 
@@ -104,6 +109,12 @@ int main(void) {
 	for (;;)
 		;
 }
+
+// TODO: A queue for messaging to load controller.
+// TODO: A task responsible for controlling loads.
+// TODO: A task that analyzes frequencies and starts load maintenance state
+// TODO: A task that displays VGA information
+// TODO: A keyboard IRQ
 
 void MaintenanceButtonInterrupt(void* context, alt_u32 id) {
 	// need to cast the context first before using it
@@ -170,82 +181,86 @@ void switchPollInit() {
 	IOWR_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE, 0x0);
 }
 
+
+/* Find least significant bit in which both the blocked_load_mask and load_value are equal.
+   This is the least important load to shed. */
+static void turn_off_least_important_load() {
+	int pos = 0;
+	int i;
+
+	for (i = 0; i < NUM_OF_LOADS; i++) {
+		// if anding the blocked mask with the only bit is the bit (then active).
+		pos = (int) pow(2, i);
+		if ((blocked_loads & pos) == 0) {
+			if ((load_value & pos) == pos) {
+				blocked_loads += pos;
+
+				printf("removing load: %d\n", pos);
+				return;
+			}
+		}
+	}
+}
+/**
+ * Find most important load to turn on inside of the shed loads.
+ */
+static void turn_on_most_important_load() {
+		int pos = 0;
+		int i;
+
+		for (i = NUM_OF_LOADS-1; i >= 0; i--) {
+			// if anding the blocked mask with the only bit is 0 => found
+			pos = (int) pow(2, i);
+			if ((blocked_loads & pos) == pos) {
+				blocked_loads -= pos;
+
+				// if adding this load did not turn off all load blocking then reset timer.
+				if (blocked_loads != 0) {
+					printf("reseting timer as not all LOADS are switched back on.\n");
+					xTimerReset(load_timer, 10);
+				}
+
+				printf("Turning on load: %d ", pos);
+				break;
+			}
+		}
+	}
+
 static void LoadManagementTask(void *pvParameters) {
 	while (1) {
 		// wait for semaphore release
 		if (xSemaphoreTake(load_manage_sem, ( TickType_t ) 10 )) {
-			// if timer active reset
-			if (xTimerIsTimerActive(load_timer) != pdFALSE) {
-				printf("reseting timer as still active\n");
-				xTimerReset(load_timer, 10);
-			} else {
+			// if not in maintenance state
+			if (maintenance_state == false) {
 				// do no computation if not in load balancing state and input is not volatile
 				if ((load_control_state == false) && (load_volatility_state == false)) {
-					printf("no volatility and no load control!\n");
-
-				} else {
-					/* TODO: Check if a switch has been turned off that was previously on
-					   and update logic to ignore on shedding and un-shedding. */
-
-
-					// if input is volatile
-					if (load_volatility_state == 1) {
-						int load = 0;
-						int pos = 0;
-						int i;
-
-						/* Find least significant bit in which both the blocked_load_mask and load_value are equal.
-						   This is the least important load to shed. */
-						for (i = 0; i < NUM_OF_LOADS; i++) {
-							// if anding the blocked mask with the only bit is the bit (then active).
-							pos = (int) pow(2, i);
-							if ((blocked_load_mask & pos) == pos) {
-								if ((load_value & pos) == pos) {
-									load = pos;
-									break;
-								}
-							}
-						}
-
-						// TODO: turn on green LED
-						printf("removing load: %d\n", load);
-						blocked_load_mask ^= load;
-
+					// if timer active reset the timer
+					if (xTimerIsTimerActive(load_timer) != pdFALSE) {
+						printf("reseting timer as still active\n");
 						xTimerReset(load_timer, 10);
 					} else {
-						// not volatile so add load
-						if (blocked_load_mask != 31) {
-							int load = 0;
-							int i;
+						// if input is volatile
+						if (load_volatility_state == 1) {
+							turn_off_least_important_load();
 
-							for (i = NUM_OF_LOADS-1; i >= 0; i--) {
-								// if anding the blocked mask with the only bit is 0 => found
-								if ((blocked_load_mask & (int) pow(2, i)) == 0) {
-									load = (int) pow(2, i);
-									break;
-								}
-							}
-
-							//TODO: turn off green LED
-
-							printf("Turning on load: %d ", load);
-							blocked_load_mask |= load;
-
-							printf("reseting timer as not all LOADS are switched back on.\n");
+							printf("reseting timer as still volatile\n");
 							xTimerReset(load_timer, 10);
 						} else {
-							load_control_state = false;
-							printf("Exiting load balancing state!\n");
+							// no longer blocking any loads
+							if (blocked_loads != 0) {
+								turn_on_most_important_load();
+							} else {
+								load_control_state = false;
+								printf("Exiting load balancing state!\n");
+							}
 						}
+
+						// TODO: could be a queue -> to turn on "loads"
+						IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, load_value-blocked_loads);
+						IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, blocked_loads);
 					}
-
-					// ensure loads are limited within mask
-					load_value &= LOAD_MASK;
-					blocked_load_mask &= LOAD_MASK;
-
-					// set red LEDS (load)
-					printf("%d : %d : %d", blocked_load_mask,load_value,load_value & blocked_load_mask);
-					IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, load_value & blocked_load_mask);
+				} else {
+					printf("no volatility and no load control!\n");
 				}
 			}
 		}
@@ -257,10 +272,15 @@ static void ToggleMaintenanceTask(void *pvParameters) {
 		if (xSemaphoreTake(maintenance_sem, ( TickType_t ) 10 )) {
 			printf("Maintenance Task \n");
 
-			//TODO: actually enter maintenance state and turn off load manager.
+			// turn off load manager timer if active
+			if (xTimerIsTimerActive(load_timer)) {
+				xTimerStop(load_timer, 10);
+			}
 
-			int* temp = (int*) pvParameters;
-			IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, *temp);
+			// toggle state and load control to false
+			maintenance_state = !maintenance_state;
+			load_control_state = false;
+			blocked_loads = 0;
 		}
 	}
 }
@@ -271,18 +291,26 @@ static void SwitchPollingTask(void *pvParameters) {
 
 		// read the value of the switch and store to uiSwitchValue
 		*temp = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
+		*temp &= LOAD_MASK;
 
 		if (load_control_state == false) {
-			// write the value of the switches to the red LEDs
-			IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, *temp & LOAD_MASK);
+
+			// TODO: could be a queue -> to turn on "loads"
+			IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, *temp);
+			IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, blocked_loads);
 
 			load_value = *temp;
 		} else {
-			/* TODO: only able to turn off loads
-			   immediately turn off load and some how update load manager about said task */
+			// only allow loads to be turned off and not on
+			blocked_loads &= *temp;
+			load_value &= *temp;
+
+			// TODO: could be a queue -> to turn on "loads"
+			IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, load_value - blocked_loads);
+			IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, blocked_loads);
 		}
 
 		// delay for 100ms
-		vTaskDelay(1000);
+		vTaskDelay(100);
 	}
 }
