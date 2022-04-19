@@ -1,316 +1,171 @@
-/* Standard includes. */
-#include <stddef.h>
 #include <stdio.h>
-#include <string.h>
-#include <math.h>
-#include <stdbool.h>
-
-/* Scheduler includes. */
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/queue.h"
-#include "freertos/semphr.h"
-#include "freertos/timers.h"
-
-/* DE2-115 includes. */
-#include "altera_avalon_pio_regs.h"	// to use PIO functions
-#include "sys\alt_irq.h"  	// to register interrupts
-/**
- * CONSTANT VARIABLES
- */
-#define LOAD_MASK		31
-#define NUM_OF_LOADS	5
-
-// Task priorities
-#define MAINTENANCE_TASK_PRIORITY		3
-#define SWITCH_POLLING_TASK_PRIORITY	1
-#define LOAD_MANAGER_TASK_PRIORITY		8
-
-/**
- * Function Definitions
- */
-
-// Task definitions
-static void ToggleMaintenanceTask(void *pvParameters);
-static void LoadManagementTask(void *pvParameters);
-static void SwitchPollingTask(void *pvParameters);
-
-// Interrupt Service Routine definitions
-void MaintenanceButtonInterrupt(void* context, alt_u32 id);
-//void FrequencyAnalyzerInterrupt(void* context, alt_u32 id);
-
-// Timer call-backs definitions
-void LoadControlTimerCallback(TimerHandle_t xTimer);
-
-// Initialisation functions definitions
-void switchPollInit();
-void maintanenceInit();
-
-/**
- * Global Variables
- */
-
-// input global variables
-unsigned int uiSwitchValue = 0;
-unsigned int uiButtonValue = 0;
-
-// System state global variables.
-bool load_volatility_state = false;
-bool maintenance_state = false;
-bool load_control_state = false;
-
-// load management masks
-int load_value = 0;
-int blocked_load_mask = 31; // 31 -> block no LOADS (11111xb)
-int blocked_loads = 0;
-
-// frequency global variables
-int rate_of_change_frequency = 0;
-int current_frequency;
-int frequency_history[5];
-
-// global timer
-TimerHandle_t load_timer;
-
-// semaphores
-SemaphoreHandle_t maintenance_sem;
-SemaphoreHandle_t load_manage_sem;
-
-/**
- * Functions
- */
-
-int main(void) {
-	// Set up semaphores
-	maintenance_sem = xSemaphoreCreateBinary();
-	load_manage_sem = xSemaphoreCreateBinary();
-
-	// Set up timer
-	int timer_id = 1;
-	load_timer = xTimerCreate("load Timer", pdMS_TO_TICKS(500), pdFALSE, &timer_id, LoadControlTimerCallback);
-
-	switchPollInit();
-	maintanenceInit();
-
-	// Register the ISRs
-	alt_irq_register(PUSH_BUTTON_IRQ, (void*) &uiButtonValue, MaintenanceButtonInterrupt);
-
-	// Create Tasks
-	xTaskCreate( ToggleMaintenanceTask, "Maintenance Task", configMINIMAL_STACK_SIZE, &uiButtonValue, MAINTENANCE_TASK_PRIORITY, NULL);
-	xTaskCreate( SwitchPollingTask, "Switch Polling Task",configMINIMAL_STACK_SIZE, &uiSwitchValue, SWITCH_POLLING_TASK_PRIORITY, NULL);
-	xTaskCreate( LoadManagementTask, "load Manager Task", configMINIMAL_STACK_SIZE, NULL, LOAD_MANAGER_TASK_PRIORITY, NULL);
+#include <stdlib.h>
+#include "sys/alt_irq.h"
+#include "system.h"
+#include "io.h"
+#include "altera_up_avalon_video_character_buffer_with_dma.h"
+#include "altera_up_avalon_video_pixel_buffer_dma.h"
 
 
-	/* Finally start the scheduler. */
+#include "FreeRTOS/FreeRTOS.h"
+#include "FreeRTOS/task.h"
+#include "FreeRTOS/queue.h"
+
+//For frequency plot
+#define FREQPLT_ORI_X 101		//x axis pixel position at the plot origin
+#define FREQPLT_GRID_SIZE_X 5	//pixel separation in the x axis between two data points
+#define FREQPLT_ORI_Y 199.0		//y axis pixel position at the plot origin
+#define FREQPLT_FREQ_RES 20.0	//number of pixels per Hz (y axis scale)
+
+#define ROCPLT_ORI_X 101
+#define ROCPLT_GRID_SIZE_X 5
+#define ROCPLT_ORI_Y 259.0
+#define ROCPLT_ROC_RES 0.5		//number of pixels per Hz/s (y axis scale)
+
+#define MIN_FREQ 45.0 //minimum frequency to draw
+
+#define PRVGADraw_Task_P      (tskIDLE_PRIORITY+1)
+TaskHandle_t PRVGADraw;
+
+
+static QueueHandle_t Q_freq_data;
+
+typedef struct{
+	unsigned int x1;
+	unsigned int y1;
+	unsigned int x2;
+	unsigned int y2;
+}Line;
+
+
+/****** VGA display ******/
+
+void PRVGADraw_Task(void *pvParameters ){
+
+
+	//initialize VGA controllers
+	alt_up_pixel_buffer_dma_dev *pixel_buf;
+	pixel_buf = alt_up_pixel_buffer_dma_open_dev(VIDEO_PIXEL_BUFFER_DMA_NAME);
+	if(pixel_buf == NULL){
+		printf("can't find pixel buffer device\n");
+	}
+	alt_up_pixel_buffer_dma_clear_screen(pixel_buf, 0);
+
+	alt_up_char_buffer_dev *char_buf;
+	char_buf = alt_up_char_buffer_open_dev("/dev/video_character_buffer_with_dma");
+	if(char_buf == NULL){
+		printf("can't find char buffer device\n");
+	}
+	alt_up_char_buffer_clear(char_buf);
+
+
+
+	//Set up plot axes
+	alt_up_pixel_buffer_dma_draw_hline(pixel_buf, 100, 590, 200, ((0x3ff << 20) + (0x3ff << 10) + (0x3ff)), 0);
+	alt_up_pixel_buffer_dma_draw_hline(pixel_buf, 100, 590, 300, ((0x3ff << 20) + (0x3ff << 10) + (0x3ff)), 0);
+	alt_up_pixel_buffer_dma_draw_vline(pixel_buf, 100, 50, 200, ((0x3ff << 20) + (0x3ff << 10) + (0x3ff)), 0);
+	alt_up_pixel_buffer_dma_draw_vline(pixel_buf, 100, 220, 300, ((0x3ff << 20) + (0x3ff << 10) + (0x3ff)), 0);
+
+	alt_up_char_buffer_string(char_buf, "Frequency(Hz)", 4, 4);
+	alt_up_char_buffer_string(char_buf, "52", 10, 7);
+	alt_up_char_buffer_string(char_buf, "50", 10, 12);
+	alt_up_char_buffer_string(char_buf, "48", 10, 17);
+	alt_up_char_buffer_string(char_buf, "46", 10, 22);
+
+	alt_up_char_buffer_string(char_buf, "df/dt(Hz/s)", 4, 26);
+	alt_up_char_buffer_string(char_buf, "60", 10, 28);
+	alt_up_char_buffer_string(char_buf, "30", 10, 30);
+	alt_up_char_buffer_string(char_buf, "0", 10, 32);
+	alt_up_char_buffer_string(char_buf, "-30", 9, 34);
+	alt_up_char_buffer_string(char_buf, "-60", 9, 36);
+
+
+	double freq[100], dfreq[100];
+	int i = 99, j = 0;
+	Line line_freq, line_roc;
+
+	while(1){
+		printf("reading from queue\n");
+		//receive frequency data from queue
+		while(uxQueueMessagesWaiting( Q_freq_data ) != 0){
+			xQueueReceive( Q_freq_data, freq+i, 0 );
+
+			//calculate frequency RoC
+
+			if(i==0){
+				dfreq[0] = (freq[0]-freq[99]) * 2.0 * freq[0] * freq[99] / (freq[0]+freq[99]);
+			}
+			else{
+				dfreq[i] = (freq[i]-freq[i-1]) * 2.0 * freq[i]* freq[i-1] / (freq[i]+freq[i-1]);
+			}
+
+			if (dfreq[i] > 100.0){
+				dfreq[i] = 100.0;
+			}
+
+
+			i =	++i%100; //point to the next data (oldest) to be overwritten
+
+		}
+		printf("printing to screen \n");
+		//clear old graph to draw new graph
+		alt_up_pixel_buffer_dma_draw_box(pixel_buf, 101, 0, 639, 199, 0, 0);
+		alt_up_pixel_buffer_dma_draw_box(pixel_buf, 101, 201, 639, 299, 0, 0);
+
+		for(j=0;j<99;++j){ //i here points to the oldest data, j loops through all the data to be drawn on VGA
+			if (((int)(freq[(i+j)%100]) > MIN_FREQ) && ((int)(freq[(i+j+1)%100]) > MIN_FREQ)){
+				//Calculate coordinates of the two data points to draw a line in between
+				//Frequency plot
+				line_freq.x1 = FREQPLT_ORI_X + FREQPLT_GRID_SIZE_X * j;
+				line_freq.y1 = (int)(FREQPLT_ORI_Y - FREQPLT_FREQ_RES * (freq[(i+j)%100] - MIN_FREQ));
+
+				line_freq.x2 = FREQPLT_ORI_X + FREQPLT_GRID_SIZE_X * (j + 1);
+				line_freq.y2 = (int)(FREQPLT_ORI_Y - FREQPLT_FREQ_RES * (freq[(i+j+1)%100] - MIN_FREQ));
+
+				//Frequency RoC plot
+				line_roc.x1 = ROCPLT_ORI_X + ROCPLT_GRID_SIZE_X * j;
+				line_roc.y1 = (int)(ROCPLT_ORI_Y - ROCPLT_ROC_RES * dfreq[(i+j)%100]);
+
+				line_roc.x2 = ROCPLT_ORI_X + ROCPLT_GRID_SIZE_X * (j + 1);
+				line_roc.y2 = (int)(ROCPLT_ORI_Y - ROCPLT_ROC_RES * dfreq[(i+j+1)%100]);
+
+				//Draw
+				alt_up_pixel_buffer_dma_draw_line(pixel_buf, line_freq.x1, line_freq.y1, line_freq.x2, line_freq.y2, 0x3ff << 0, 0);
+				alt_up_pixel_buffer_dma_draw_line(pixel_buf, line_roc.x1, line_roc.y1, line_roc.x2, line_roc.y2, 0x3ff << 0, 0);
+			}
+		}
+		vTaskDelay(10);
+
+	}
+}
+
+void freq_relay(){
+	#define SAMPLING_FREQ 16000.0
+	double temp = SAMPLING_FREQ/(double)IORD(FREQUENCY_ANALYSER_BASE, 0);
+
+	xQueueSendToBackFromISR( Q_freq_data, &temp, pdFALSE );
+
+	return;
+}
+
+
+
+int main()
+{
+	printf("main");
+	Q_freq_data = xQueueCreate( 100, sizeof(double) );
+
+
+	alt_irq_register(FREQUENCY_ANALYSER_IRQ, 0, freq_relay);
+
+	xTaskCreate( PRVGADraw_Task, "DrawTsk", configMINIMAL_STACK_SIZE, NULL, PRVGADraw_Task_P, &PRVGADraw );
+
+
+
 	vTaskStartScheduler();
 
-	/* Will only reach here if there is insufficient heap available to start
-	 the scheduler. */
-	for (;;)
-		;
+	while(1)
+
+  return 0;
 }
 
-// TODO: A queue for messaging to load controller.
-// TODO: A task responsible for controlling loads.
-// TODO: A task that analyzes frequencies and starts load maintenance state
-// TODO: A task that displays VGA information
-// TODO: A keyboard IRQ
-
-void MaintenanceButtonInterrupt(void* context, alt_u32 id) {
-	// need to cast the context first before using it
-	int* temp = (int*) context;
-	(*temp) = IORD_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE);
-
-	// clears the edge capture register
-	IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
-
-	// This logic is in place of actual relay for now.
-	if (*temp == 1) {
-		xSemaphoreGiveFromISR(maintenance_sem, pdFALSE);
-	} else if (*temp == 2) {
-		printf("Relay is volatile \n");
-		load_volatility_state = true;
-		load_control_state = true;
-
-		xSemaphoreGiveFromISR(load_manage_sem, pdFALSE);
-	} else if (*temp == 4) {
-		printf("Relay is not volatile: \n");
-		load_volatility_state = false;
-
-		xSemaphoreGiveFromISR(load_manage_sem, pdFALSE);
-	}
-}
-
-// currently not used
-//void FrequencyAnalyzerInterrupt(void* context, alt_u32 id) {
-//	int* temp = (int*) context;
-//
-//	// determine whether passed value is bad
-//	if (*temp == 1) {
-//		// check if timer active
-//		if (xTimerIsTimerActive(load_timer) != pdFALSE) {
-//			// If active reset timer
-//			BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-//
-//			xTimerResetFromISR(load_timer, &xHigherPriorityTaskWoken);
-//		} else {
-//			// call load_control task
-//			xSemaphoreGiveFromISR(load_manage_sem, pdFALSE);
-//		}
-//	}
-//}
-
-void LoadControlTimerCallback(TimerHandle_t xTimer) {
-	printf("timer call back...\n");
-	xSemaphoreGiveFromISR(load_manage_sem, pdFALSE);
-}
-
-void maintanenceInit() {
-	// clears the edge capture register. Writing 1 to bit clears pending interrupt for corresponding button.
-	IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
-	IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, 0x0);
-	// enable interrupts for first two buttons (for now)
-	IOWR_ALTERA_AVALON_PIO_IRQ_MASK(PUSH_BUTTON_BASE, 0x7);
-
-
-}
-
-void switchPollInit() {
-	// switch polling setup
-	IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, 0x0);
-	IOWR_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE, 0x0);
-}
-
-
-/* Find least significant bit in which both the blocked_load_mask and load_value are equal.
-   This is the least important load to shed. */
-static void turn_off_least_important_load() {
-	int pos = 0;
-	int i;
-
-	for (i = 0; i < NUM_OF_LOADS; i++) {
-		// if anding the blocked mask with the only bit is the bit (then active).
-		pos = (int) pow(2, i);
-		if ((blocked_loads & pos) == 0) {
-			if ((load_value & pos) == pos) {
-				blocked_loads += pos;
-
-				printf("removing load: %d\n", pos);
-				return;
-			}
-		}
-	}
-}
-/**
- * Find most important load to turn on inside of the shed loads.
- */
-static void turn_on_most_important_load() {
-		int pos = 0;
-		int i;
-
-		for (i = NUM_OF_LOADS-1; i >= 0; i--) {
-			// if anding the blocked mask with the only bit is 0 => found
-			pos = (int) pow(2, i);
-			if ((blocked_loads & pos) == pos) {
-				blocked_loads -= pos;
-
-				// if adding this load did not turn off all load blocking then reset timer.
-				if (blocked_loads != 0) {
-					printf("reseting timer as not all LOADS are switched back on.\n");
-					xTimerReset(load_timer, 10);
-				}
-
-				printf("Turning on load: %d ", pos);
-				break;
-			}
-		}
-	}
-
-static void LoadManagementTask(void *pvParameters) {
-	while (1) {
-		// wait for semaphore release
-		if (xSemaphoreTake(load_manage_sem, ( TickType_t ) 10 )) {
-			// if not in maintenance state
-			if (maintenance_state == false) {
-				// do no computation if not in load balancing state and input is not volatile
-				if ((load_control_state == false) && (load_volatility_state == false)) {
-					// if timer active reset the timer
-					if (xTimerIsTimerActive(load_timer) != pdFALSE) {
-						printf("reseting timer as still active\n");
-						xTimerReset(load_timer, 10);
-					} else {
-						// if input is volatile
-						if (load_volatility_state == 1) {
-							turn_off_least_important_load();
-
-							printf("reseting timer as still volatile\n");
-							xTimerReset(load_timer, 10);
-						} else {
-							// no longer blocking any loads
-							if (blocked_loads != 0) {
-								turn_on_most_important_load();
-							} else {
-								load_control_state = false;
-								printf("Exiting load balancing state!\n");
-							}
-						}
-
-						// TODO: could be a queue -> to turn on "loads"
-						IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, load_value-blocked_loads);
-						IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, blocked_loads);
-					}
-				} else {
-					printf("no volatility and no load control!\n");
-				}
-			}
-		}
-	}
-}
-
-static void ToggleMaintenanceTask(void *pvParameters) {
-	while (1) {
-		if (xSemaphoreTake(maintenance_sem, ( TickType_t ) 10 )) {
-			printf("Maintenance Task \n");
-
-			// turn off load manager timer if active
-			if (xTimerIsTimerActive(load_timer)) {
-				xTimerStop(load_timer, 10);
-			}
-
-			// toggle state and load control to false
-			maintenance_state = !maintenance_state;
-			load_control_state = false;
-			blocked_loads = 0;
-		}
-	}
-}
-
-static void SwitchPollingTask(void *pvParameters) {
-	while (1) {
-		unsigned int* temp = (unsigned int*) pvParameters;
-
-		// read the value of the switch and store to uiSwitchValue
-		*temp = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
-		*temp &= LOAD_MASK;
-
-		if (load_control_state == false) {
-
-			// TODO: could be a queue -> to turn on "loads"
-			IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, *temp);
-			IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, blocked_loads);
-
-			load_value = *temp;
-		} else {
-			// only allow loads to be turned off and not on
-			blocked_loads &= *temp;
-			load_value &= *temp;
-
-			// TODO: could be a queue -> to turn on "loads"
-			IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, load_value - blocked_loads);
-			IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, blocked_loads);
-		}
-
-		// delay for 100ms
-		vTaskDelay(100);
-	}
-}

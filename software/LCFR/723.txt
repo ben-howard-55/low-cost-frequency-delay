@@ -1,0 +1,58 @@
+maintenance task
+- triggered when the button is pressed
+- runs a task which will toggle the maintenance state
+
+freuqency task
+- triggered when new information is available from the frequency analyser
+- gets data from a queue
+- will run the calculations to find frequency and roc
+- write the frequency info to a history state for the vga task
+- will then check whether the system is stable or not, partially with threshold state
+- if maintenance mode is not on and stability is different from global state
+	it will update the global state and it will call the load manager
+
+load manager task
+- if the timer is active, reset the timer
+- if the timer is not active:
+
+- if we are not managing loads and the system is stable, do nothing
+- if we are not managing loads and the system is unstable:
+	- set managing loads to true
+	- instantly shed a load
+	- start the timer
+- if we are managing loads and the system is stable
+	- this means we were triggered by the callback
+	- if there is a load which is blocked:
+		- turn it on
+		- start the timer
+	- if there is not:
+		- set load managing to false
+		- done
+- if we are managing loads and the system is unstable
+	- this also means we were triggered by the callback
+	- shed load if possible
+	- start the timer
+
+switch poll task
+- triggered on a timer
+- if we are managing loads:
+	- check against the previous value and make sure that the change
+		doesn't turn a load on
+	- allow it if it does, otherwise don't
+	- turn off the blocked load if we turn one off in this state and
+		it is blocked
+- if we are not:
+	- allow any updates
+
+keyboard task
+- check the character
+- if the character is an enter and there is content in the buffer, update
+	the threshold state
+- otherwise, if character is is number or first full stop add it to buffer
+
+vga display task
+- triggered on a timer
+- reads info and displays it
+	- frequency history
+	- stability or not
+	- threshold info
