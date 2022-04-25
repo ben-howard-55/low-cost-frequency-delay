@@ -1,8 +1,8 @@
-maintenance task
+DONE: maintenance task
 - triggered when the button is pressed
 - runs a task which will toggle the maintenance state
 
-freuqency task
+DONE: frequency task
 - triggered when new information is available from the frequency analyser
 - gets data from a queue
 - will run the calculations to find frequency and roc
@@ -33,7 +33,7 @@ load manager task
 	- shed load if possible
 	- start the timer
 
-switch poll task
+DONE: switch poll task
 - triggered on a timer
 - if we are managing loads:
 	- check against the previous value and make sure that the change
