@@ -264,16 +264,16 @@ static void frequencyAnalyserTask(void *pvParameters) {
  *  Find least significant bit in which both the blocked_load_mask and
  * load_value are equal. This is the least important load to shed.
  */
-static void turn_off_least_important_load() {
+static void shedLoad() {
   int pos = 0;
   int i;
 
   for (i = 0; i < NUM_OF_LOADS; i++) {
     // if anding the blocked mask with the only bit is the bit (then active).
     pos = (int)pow(2, i);
-    if ((blocked_loads & pos) == 0) {
-      if ((load_value & pos) == pos) {
-        blocked_loads += pos;
+    if ((blockedLoadState.blockedLoads & pos) == 0) {
+      if ((activatedLoadState.activatedLoads & pos) == pos) {
+        blockedLoadState.blockedLoads += pos;
 
         printf("removing load: %d\n", pos);
         return;
@@ -285,21 +285,21 @@ static void turn_off_least_important_load() {
 /**
  *	 Find most important load to turn on inside of the shed loads.
  */
-static void turn_on_most_important_load() {
+static void activateLoad() {
   int pos = 0;
   int i;
 
   for (i = NUM_OF_LOADS - 1; i >= 0; i--) {
     // if anding the blocked mask with the only bit is 0 => found
     pos = (int)pow(2, i);
-    if ((blocked_loads & pos) == pos) {
-      blocked_loads -= pos;
+    if ((blockedLoadState.blockedLoads & pos) == pos) {
+      blockedLoadState.blockedLoads -= pos;
 
       // if adding this load did not turn off all load blocking then reset
       // timer.
-      if (blocked_loads != 0) {
+      if (blockedLoadState.blockedLoads != 0) {
         printf("reseting timer as not all LOADS are switched back on.\n");
-        xTimerReset(load_timer, 10);
+        xTimerReset(loadManagementTimer, 10);
       }
 
       printf("Turning on load: %d ", pos);
@@ -316,30 +316,42 @@ static void loadManagerTask(void *pvParameters) {
         printf("reseting timer as already active\n");
         xTimerReset(loadManagementTimer, 10);
       } else {
-        if (unstable_state) {
-          managing_load_state = true;
-          turn_off_least_important_load();
+        xSemaphoreTake(blockedLoadState.mutex, portMAX_DELAY);
+        xSemaphoreTake(activatedLoadState.mutex, portMAX_DELAY);
+
+        xSemaphoreTake(stabilityState.mutex, portMAX_DELAY);
+        xSemaphoreTake(loadManagementState.mutex, portMAX_DELAY);
+        if (!stabilityState.isStable) {
+          loadManagementState.isManagingLoads = true;
+          shedLoad();
 
           printf("reseting timer as state is unstable\n");
-          xTimerReset(load_timer, 10);
-        } else if (!unstable_state && managing_load_state) {
-          turn_on_most_important_load();
+          xTimerReset(loadManagementTimer, 10);
+        } else if (stabilityState.isStable &&
+                   loadManagementState.isManagingLoads) {
+          activateLoad();
 
           // reset timer if more loads to unblock, else exit control state
-          if (blocked_loads > 0) {
+          if (blockedLoadState.blockedLoads > 0) {
             printf("reseting timer as more loads need reconnecting\n");
-            xTimerReset(load_timer, 10);
+            xTimerReset(loadManagementTimer, 10);
           } else {
             printf("exiting load management state\n");
-            managing_load_state = false;
+            loadManagementState.isManagingLoads = false;
           }
         }
+        xSemaphoreGive(loadManagementState.mutex);
+        xSemaphoreGive(stabilityState.mutex);
 
-        struct loadValues loads;
-        loads.loads = load_value - blocked_loads;
-        loads.blocked_loads = blocked_loads;
+        struct LoadStatus loads;
+        loads.activatedLoads =
+            activatedLoadState.activatedLoads - blockedLoadState.blockedLoads;
+        loads.blockedLoads = blockedLoadState.blockedLoads;
 
-        xQueueSendToBack(TaskQ, loads, pdFALSE);
+        xSemaphoreGive(blockedLoadState.mutex);
+        xSemaphoreGive(activatedLoadState.mutex);
+
+        xQueueSendToBack(loadControlQueue, loads, pdFALSE);
       }
     }
   }
@@ -347,7 +359,131 @@ static void loadManagerTask(void *pvParameters) {
 
 static void keyboardTask(void *pvParameters) {}
 
-static void vgaRefreshTask(void *pvParameters) {}
+static void vgaRefreshTask(void *pvParameters) {
+  // initialize VGA controllers
+  alt_up_pixel_buffer_dma_dev *pixel_buf;
+  pixel_buf = alt_up_pixel_buffer_dma_open_dev(VIDEO_PIXEL_BUFFER_DMA_NAME);
+  if (pixel_buf == NULL) {
+    printf("can't find pixel buffer device\n");
+  }
+  alt_up_pixel_buffer_dma_clear_screen(pixel_buf, 0);
+
+  alt_up_char_buffer_dev *char_buf;
+  char_buf =
+      alt_up_char_buffer_open_dev("/dev/video_character_buffer_with_dma");
+  if (char_buf == NULL) {
+    printf("can't find char buffer device\n");
+  }
+  alt_up_char_buffer_clear(char_buf);
+
+  // Set up plot axes
+  alt_up_pixel_buffer_dma_draw_hline(
+      pixel_buf, 100, 590, 200, ((0x3ff << 20) + (0x3ff << 10) + (0x3ff)), 0);
+  alt_up_pixel_buffer_dma_draw_hline(
+      pixel_buf, 100, 590, 300, ((0x3ff << 20) + (0x3ff << 10) + (0x3ff)), 0);
+  alt_up_pixel_buffer_dma_draw_vline(
+      pixel_buf, 100, 50, 200, ((0x3ff << 20) + (0x3ff << 10) + (0x3ff)), 0);
+  alt_up_pixel_buffer_dma_draw_vline(
+      pixel_buf, 100, 220, 300, ((0x3ff << 20) + (0x3ff << 10) + (0x3ff)), 0);
+
+  alt_up_char_buffer_string(char_buf, "Frequency(Hz)", 4, 4);
+  alt_up_char_buffer_string(char_buf, "52", 10, 7);
+  alt_up_char_buffer_string(char_buf, "50", 10, 12);
+  alt_up_char_buffer_string(char_buf, "48", 10, 17);
+  alt_up_char_buffer_string(char_buf, "46", 10, 22);
+
+  alt_up_char_buffer_string(char_buf, "df/dt(Hz/s)", 4, 26);
+  alt_up_char_buffer_string(char_buf, "60", 10, 28);
+  alt_up_char_buffer_string(char_buf, "30", 10, 30);
+  alt_up_char_buffer_string(char_buf, "0", 10, 32);
+  alt_up_char_buffer_string(char_buf, "-30", 9, 34);
+  alt_up_char_buffer_string(char_buf, "-60", 9, 36);
+
+  Line line_freq, line_roc;
+
+  while (1) {
+    xSemaphoreTake(frequencyHistoryState.mutex, portMAX_DELAY);
+
+    int currentIndex = (frequencyHistoryState.i - 1) % 100;
+
+    printf("printing to screen \n");
+    // clear old graph to draw new graph
+    alt_up_pixel_buffer_dma_draw_box(pixel_buf, 101, 0, 639, 199, 0, 0);
+    alt_up_pixel_buffer_dma_draw_box(pixel_buf, 101, 201, 639, 299, 0, 0);
+
+    xSemaphoreTake(thresholdState.mutex, portMAX_DELAY);
+    alt_up_char_buffer_string(
+        char_buf, "Lower threshold:", INSTANTANEOUS_FREQUENCY_THRESHOLD, 40);
+    alt_up_char_buffer_string(char_buf, "43.7 Hz",
+                              frequencyHistoryState.freqHistory[currentIndex],
+                              40);
+
+    alt_up_char_buffer_string(char_buf,
+                              "RoC threshold:", thresholdState.threshold, 42);
+    alt_up_char_buffer_string(
+        char_buf, "0.6 Hz/sec",
+        frequencyHistoryState.freqRocHistory[currentIndex], 42);
+
+    alt_up_char_buffer_string(char_buf, "System status", 50, 40);
+    alt_up_char_buffer_string(char_buf, "Stable", 54, 42);
+
+    xSemaphoreGive(thresholdState.mutex);
+
+    int i = frequencyHistoryState.i;
+    for (j = 0; j < 99; ++j) { // i here points to the oldest data, j loops
+      // through all the data to be drawn on VGA
+      if (((int)(frequencyHistoryState.freqHistory[(i + j) % 100]) >
+           MIN_FREQ) &&
+          ((int)(frequencyHistoryState.freqHistory[(i + j + 1) % 100]) >
+           MIN_FREQ)) {
+        // Calculate coordinates of the two data points
+        to draw a line in between
+            // Frequency plot
+            line_freq.x1 = FREQPLT_ORI_X + FREQPLT_GRID_SIZE_X
+
+                                               j;
+        line_freq.y1 =
+            (int)(FREQPLT_ORI_Y -
+                  FREQPLT_FREQ_RES *
+                      (frequencyHistoryState.freqHistory[(i + j) % 100] -
+                       MIN_FREQ));
+
+        line_freq.x2 = FREQPLT_ORI_X + FREQPLT_GRID_SIZE_X(j + 1);
+        line_freq.y2 =
+            (int)(FREQPLT_ORI_Y -
+                  FREQPLT_FREQ_RES *
+                      (frequencyHistoryState.freqHistory[(i + j + 1) % 100] -
+                       MIN_FREQ));
+
+        // Frequency RoC plot
+        line_roc.x1 = ROCPLT_ORI_X + ROCPLT_GRID_SIZE_X
+
+                                         j;
+        line_roc.y1 =
+            (int)(ROCPLT_ORI_Y -
+                  ROCPLT_ROC_RES *
+                      frequencyHistoryState.freqRocHistory[(i + j) % 100]);
+
+        line_roc.x2 = ROCPLT_ORI_X + ROCPLT_GRID_SIZE_X(j + 1);
+        line_roc.y2 =
+            (int)(ROCPLT_ORI_Y -
+                  ROCPLT_ROC_RES *
+                      frequencyHistoryState.freqRocHistory[(i + j + 1) % 100]);
+
+        // Draw
+        alt_up_pixel_buffer_dma_draw_line(pixel_buf, line_freq.x1, line_freq.y1,
+                                          line_freq.x2, line_freq.y2,
+                                          0x3ff << 0, 0);
+        alt_up_pixel_buffer_dma_draw_line(pixel_buf, line_roc.x1, line_roc.y1,
+                                          line_roc.x2, line_roc.y2, 0x3ff << 0,
+                                          0);
+      }
+    }
+    vTaskDelay(10);
+
+    xSemaphoreGive(frequencyHistoryState.mutex);
+  }
+}
 
 static void ledManagerTask(void *pvParameters) {
   struct LoadStatus loads;
